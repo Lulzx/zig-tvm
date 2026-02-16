@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
         "src/cell.zig",
         "src/tvm.zig",
         "src/ops.zig",
+        "src/dict.zig",
         "src/main.zig",
     };
 

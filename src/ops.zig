@@ -1,6 +1,7 @@
 const std = @import("std");
 const tvm_mod = @import("tvm.zig");
 const cell = @import("cell.zig");
+const dict = @import("dict.zig");
 
 const TVM = tvm_mod.TVM;
 const TvmError = tvm_mod.TvmError;
@@ -10,6 +11,7 @@ const Slice = cell.Slice;
 const Builder = cell.Builder;
 const Continuation = tvm_mod.Continuation;
 const Tuple = tvm_mod.Tuple;
+const DictKey = dict.DictKey;
 
 const Handler = *const fn (*TVM, u32) TvmError!void;
 
@@ -1602,23 +1604,216 @@ fn op_cont_prefix(vm: *TVM, _: u32) TvmError!void {
     }
 }
 
-// ── Dictionary ops (stubs) ─────────────────────────────────────────────
+// ── Dictionary ops ─────────────────────────────────────────────────────
+
+const KeyMode = enum { raw, signed, unsigned };
+
+fn popDictAndKey(vm: *TVM, mode: KeyMode) TvmError!struct { dict_cell: ?*cell.Cell, key: DictKey, key_len: u16 } {
+    const n_val = try (try vm.stack.pop()).asInt();
+    const n = n_val.toI64();
+    if (n < 0 or n > 1023) return error.IntegerOutOfRange;
+    const key_len: u16 = @intCast(n);
+
+    const dict_val = try vm.stack.pop();
+    const dict_cell: ?*cell.Cell = switch (dict_val) {
+        .cell => |c| c,
+        .null => null,
+        .slice => |s| if (s.remainingBits() == 0 and s.remainingRefs() == 0) null else s.cell,
+        else => return error.TypeMismatch,
+    };
+
+    var key: DictKey = undefined;
+    switch (mode) {
+        .raw => {
+            var ks = try (try vm.stack.pop()).asSlice();
+            key = dict.sliceToDictKey(&ks, key_len) catch return error.CellUnderflow;
+        },
+        .signed => {
+            const i_val = try (try vm.stack.pop()).asInt();
+            const i = i_val.toI64();
+            key = DictKey.fromInt(i, key_len);
+        },
+        .unsigned => {
+            const i_val = try (try vm.stack.pop()).asInt();
+            const i: u64 = @bitCast(i_val.toI64());
+            key = DictKey.fromUint(i, key_len);
+        },
+    }
+    key.bit_len = key_len;
+
+    return .{ .dict_cell = dict_cell, .key = key, .key_len = key_len };
+}
+
+fn dictCellToValue(c: ?*cell.Cell) Value {
+    if (c) |ptr| return .{ .cell = ptr };
+    return .null;
+}
 
 fn op_dict_prefix(vm: *TVM, _: u32) TvmError!void {
     try vm.charge(26);
     const sub = try vm.fetchUint(8);
+
     switch (sub) {
-        0x00, 0x01 => {
-            // NEWDICT — push null/empty slice
+        0x00 => {
+            // NEWDICT — push null
             try vm.stack.push(.null);
         },
+        0x01 => {
+            // DICTEMPTY — check if dict is empty
+            const d = try vm.stack.pop();
+            const is_empty = switch (d) {
+                .null => true,
+                .cell => false,
+                .slice => |s| s.remainingBits() == 0 and s.remainingRefs() == 0,
+                else => return error.TypeMismatch,
+            };
+            try vm.stack.push(.{ .int = Int257.fromI64(if (is_empty) -1 else 0) });
+        },
         0x4A => {
-            // DICTGET (simplified stub)
-            _ = try vm.stack.pop(); // key
-            _ = try vm.stack.pop(); // dict
-            _ = try vm.stack.pop(); // key len
-            try vm.stack.push(.null);
-            try vm.stack.push(.{ .int = Int257.fromI64(0) }); // not found
+            // DICTGET: k D n — v? f
+            const info = try popDictAndKey(vm, .raw);
+            const result = dict.dictGet(info.dict_cell, &info.key, info.key_len) catch {
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+                return;
+            };
+            if (result) |s| {
+                try vm.stack.push(.{ .slice = s });
+                try vm.stack.push(.{ .int = Int257.fromI64(-1) });
+            } else {
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+            }
+        },
+        0x4B => {
+            // DICTIGET: i D n — v? f
+            const info = try popDictAndKey(vm, .signed);
+            const result = dict.dictGet(info.dict_cell, &info.key, info.key_len) catch {
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+                return;
+            };
+            if (result) |s| {
+                try vm.stack.push(.{ .slice = s });
+                try vm.stack.push(.{ .int = Int257.fromI64(-1) });
+            } else {
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+            }
+        },
+        0x4C => {
+            // DICTUGET: i D n — v? f
+            const info = try popDictAndKey(vm, .unsigned);
+            const result = dict.dictGet(info.dict_cell, &info.key, info.key_len) catch {
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+                return;
+            };
+            if (result) |s| {
+                try vm.stack.push(.{ .slice = s });
+                try vm.stack.push(.{ .int = Int257.fromI64(-1) });
+            } else {
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+            }
+        },
+        0x12 => {
+            // DICTSET: v k D n — D'
+            const n_val = try (try vm.stack.pop()).asInt();
+            const n = n_val.toI64();
+            if (n < 0 or n > 1023) return error.IntegerOutOfRange;
+            const key_len: u16 = @intCast(n);
+
+            const dict_val = try vm.stack.pop();
+            const dict_cell: ?*cell.Cell = switch (dict_val) {
+                .cell => |c| c,
+                .null => null,
+                .slice => |s| if (s.remainingBits() == 0 and s.remainingRefs() == 0) null else s.cell,
+                else => return error.TypeMismatch,
+            };
+
+            var ks = try (try vm.stack.pop()).asSlice();
+            var key = dict.sliceToDictKey(&ks, key_len) catch return error.CellUnderflow;
+            key.bit_len = key_len;
+
+            var vs = try (try vm.stack.pop()).asSlice();
+            const new_root = dict.dictSet(dict_cell, &key, key_len, &vs, vm.cell_arena) catch return error.CellOverflow;
+            try vm.stack.push(.{ .cell = new_root });
+        },
+        0x15 => {
+            // DICTISET: v i D n — D'
+            const n_val = try (try vm.stack.pop()).asInt();
+            const n = n_val.toI64();
+            if (n < 0 or n > 1023) return error.IntegerOutOfRange;
+            const key_len: u16 = @intCast(n);
+
+            const dict_val = try vm.stack.pop();
+            const dict_cell: ?*cell.Cell = switch (dict_val) {
+                .cell => |c| c,
+                .null => null,
+                .slice => |s| if (s.remainingBits() == 0 and s.remainingRefs() == 0) null else s.cell,
+                else => return error.TypeMismatch,
+            };
+
+            const i_val = try (try vm.stack.pop()).asInt();
+            const i = i_val.toI64();
+            var key = DictKey.fromInt(i, key_len);
+            key.bit_len = key_len;
+
+            var vs = try (try vm.stack.pop()).asSlice();
+            const new_root = dict.dictSet(dict_cell, &key, key_len, &vs, vm.cell_arena) catch return error.CellOverflow;
+            try vm.stack.push(.{ .cell = new_root });
+        },
+        0x16 => {
+            // DICTUSET: v i D n — D'
+            const n_val = try (try vm.stack.pop()).asInt();
+            const n = n_val.toI64();
+            if (n < 0 or n > 1023) return error.IntegerOutOfRange;
+            const key_len: u16 = @intCast(n);
+
+            const dict_val = try vm.stack.pop();
+            const dict_cell: ?*cell.Cell = switch (dict_val) {
+                .cell => |c| c,
+                .null => null,
+                .slice => |s| if (s.remainingBits() == 0 and s.remainingRefs() == 0) null else s.cell,
+                else => return error.TypeMismatch,
+            };
+
+            const i_val = try (try vm.stack.pop()).asInt();
+            const i: u64 = @bitCast(i_val.toI64());
+            var key = DictKey.fromUint(i, key_len);
+            key.bit_len = key_len;
+
+            var vs = try (try vm.stack.pop()).asSlice();
+            const new_root = dict.dictSet(dict_cell, &key, key_len, &vs, vm.cell_arena) catch return error.CellOverflow;
+            try vm.stack.push(.{ .cell = new_root });
+        },
+        0x22 => {
+            // DICTDEL: k D n — D' f
+            const info = try popDictAndKey(vm, .raw);
+            const result = dict.dictDel(info.dict_cell, &info.key, info.key_len, vm.cell_arena) catch {
+                try vm.stack.push(dictCellToValue(info.dict_cell));
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+                return;
+            };
+            try vm.stack.push(dictCellToValue(result.root));
+            try vm.stack.push(.{ .int = Int257.fromI64(if (result.deleted) -1 else 0) });
+        },
+        0x25 => {
+            // DICTIDEL: i D n — D' f
+            const info = try popDictAndKey(vm, .signed);
+            const result = dict.dictDel(info.dict_cell, &info.key, info.key_len, vm.cell_arena) catch {
+                try vm.stack.push(dictCellToValue(info.dict_cell));
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+                return;
+            };
+            try vm.stack.push(dictCellToValue(result.root));
+            try vm.stack.push(.{ .int = Int257.fromI64(if (result.deleted) -1 else 0) });
+        },
+        0x26 => {
+            // DICTUDEL: i D n — D' f
+            const info = try popDictAndKey(vm, .unsigned);
+            const result = dict.dictDel(info.dict_cell, &info.key, info.key_len, vm.cell_arena) catch {
+                try vm.stack.push(dictCellToValue(info.dict_cell));
+                try vm.stack.push(.{ .int = Int257.fromI64(0) });
+                return;
+            };
+            try vm.stack.push(dictCellToValue(result.root));
+            try vm.stack.push(.{ .int = Int257.fromI64(if (result.deleted) -1 else 0) });
         },
         else => return error.InvalidOpcode,
     }
