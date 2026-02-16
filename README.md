@@ -1,6 +1,6 @@
 # zig-tvm
 
-A compact, table-driven implementation of the [TON Virtual Machine](https://docs.ton.org/tvm.pdf) (TVM) in Zig.
+A compact, table-driven implementation of the [TON Virtual Machine](https://ton-blockchain.github.io/docs/tvm.pdf) (TVM) in Zig.
 
 ## Features
 
