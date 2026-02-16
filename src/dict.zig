@@ -694,3 +694,214 @@ test "bitLength" {
     try std.testing.expectEqual(@as(u16, 3), bitLength(4));
     try std.testing.expectEqual(@as(u16, 8), bitLength(255));
 }
+
+// ── Edge-case tests ────────────────────────────────────────────────────
+
+fn makeValue(arena: *CellArena, val: u64) Slice {
+    var vb = Builder.init();
+    vb.storeUint(val, 16) catch unreachable;
+    const vc = vb.finalize(arena) catch unreachable;
+    return Slice.fromCell(vc);
+}
+
+fn getValue(maybe_s: ?Slice) ?u64 {
+    var s = maybe_s orelse return null;
+    return s.loadUint(16) catch null;
+}
+
+test "dict with 1-bit key width" {
+    var arena = CellArena.init();
+
+    // Only two possible keys: 0 and 1
+    const key0 = DictKey.fromUint(0, 1);
+    const key1 = DictKey.fromUint(1, 1);
+
+    var vs0 = makeValue(&arena, 0xAA);
+    var root = try dictSet(null, &key0, 1, &vs0, &arena);
+
+    var vs1 = makeValue(&arena, 0xBB);
+    root = try dictSet(root, &key1, 1, &vs1, &arena);
+
+    try std.testing.expectEqual(@as(u64, 0xAA), getValue(try dictGet(root, &key0, 1)).?);
+    try std.testing.expectEqual(@as(u64, 0xBB), getValue(try dictGet(root, &key1, 1)).?);
+}
+
+test "dict with zero key" {
+    var arena = CellArena.init();
+
+    const key = DictKey.fromUint(0, 8);
+    var vs = makeValue(&arena, 0xDEAD);
+    const root = try dictSet(null, &key, 8, &vs, &arena);
+
+    try std.testing.expectEqual(@as(u64, 0xDEAD), getValue(try dictGet(root, &key, 8)).?);
+}
+
+test "dict with max key (0xFF for 8-bit)" {
+    var arena = CellArena.init();
+
+    const key = DictKey.fromUint(0xFF, 8);
+    var vs = makeValue(&arena, 0xBEEF);
+    const root = try dictSet(null, &key, 8, &vs, &arena);
+
+    try std.testing.expectEqual(@as(u64, 0xBEEF), getValue(try dictGet(root, &key, 8)).?);
+}
+
+test "dict with signed negative key" {
+    var arena = CellArena.init();
+
+    const key_neg = DictKey.fromInt(-1, 8);
+    const key_pos = DictKey.fromInt(1, 8);
+
+    var vs_neg = makeValue(&arena, 111);
+    var root = try dictSet(null, &key_neg, 8, &vs_neg, &arena);
+
+    var vs_pos = makeValue(&arena, 222);
+    root = try dictSet(root, &key_pos, 8, &vs_pos, &arena);
+
+    try std.testing.expectEqual(@as(u64, 111), getValue(try dictGet(root, &key_neg, 8)).?);
+    try std.testing.expectEqual(@as(u64, 222), getValue(try dictGet(root, &key_pos, 8)).?);
+}
+
+test "dict keys sharing long common prefix" {
+    var arena = CellArena.init();
+
+    // 0b00000000 and 0b00000001 share 7-bit prefix
+    const key0 = DictKey.fromUint(0, 8);
+    const key1 = DictKey.fromUint(1, 8);
+
+    var vs0 = makeValue(&arena, 10);
+    var root = try dictSet(null, &key0, 8, &vs0, &arena);
+
+    var vs1 = makeValue(&arena, 11);
+    root = try dictSet(root, &key1, 8, &vs1, &arena);
+
+    try std.testing.expectEqual(@as(u64, 10), getValue(try dictGet(root, &key0, 8)).?);
+    try std.testing.expectEqual(@as(u64, 11), getValue(try dictGet(root, &key1, 8)).?);
+}
+
+test "dict delete from 3-key dict leaves 2 intact" {
+    var arena = CellArena.init();
+
+    const key1 = DictKey.fromUint(10, 8);
+    const key2 = DictKey.fromUint(20, 8);
+    const key3 = DictKey.fromUint(30, 8);
+
+    var vs1 = makeValue(&arena, 100);
+    var root: ?*Cell = try dictSet(null, &key1, 8, &vs1, &arena);
+    var vs2 = makeValue(&arena, 200);
+    root = try dictSet(root, &key2, 8, &vs2, &arena);
+    var vs3 = makeValue(&arena, 300);
+    root = try dictSet(root, &key3, 8, &vs3, &arena);
+
+    // Delete middle key
+    const del = try dictDel(root, &key2, 8, &arena);
+    try std.testing.expect(del.deleted);
+
+    // Remaining keys still work
+    try std.testing.expectEqual(@as(u64, 100), getValue(try dictGet(del.root, &key1, 8)).?);
+    try std.testing.expect((try dictGet(del.root, &key2, 8)) == null);
+    try std.testing.expectEqual(@as(u64, 300), getValue(try dictGet(del.root, &key3, 8)).?);
+}
+
+test "dict delete all keys yields empty dict" {
+    var arena = CellArena.init();
+
+    const key1 = DictKey.fromUint(0xAA, 8);
+    const key2 = DictKey.fromUint(0x55, 8);
+
+    var vs1 = makeValue(&arena, 1);
+    var root: ?*Cell = try dictSet(null, &key1, 8, &vs1, &arena);
+    var vs2 = makeValue(&arena, 2);
+    root = try dictSet(root, &key2, 8, &vs2, &arena);
+
+    const del1 = try dictDel(root, &key1, 8, &arena);
+    try std.testing.expect(del1.deleted);
+    const del2 = try dictDel(del1.root, &key2, 8, &arena);
+    try std.testing.expect(del2.deleted);
+    try std.testing.expect(del2.root == null);
+}
+
+test "dict delete from empty dict is no-op" {
+    var arena = CellArena.init();
+    const key = DictKey.fromUint(42, 8);
+    const result = try dictDel(null, &key, 8, &arena);
+    try std.testing.expect(!result.deleted);
+    try std.testing.expect(result.root == null);
+}
+
+test "dict overwrite preserves other keys" {
+    var arena = CellArena.init();
+
+    const key1 = DictKey.fromUint(1, 8);
+    const key2 = DictKey.fromUint(2, 8);
+
+    var vs1 = makeValue(&arena, 100);
+    var root: ?*Cell = try dictSet(null, &key1, 8, &vs1, &arena);
+    var vs2 = makeValue(&arena, 200);
+    root = try dictSet(root, &key2, 8, &vs2, &arena);
+
+    // Overwrite key1
+    var vs1_new = makeValue(&arena, 999);
+    root = try dictSet(root, &key1, 8, &vs1_new, &arena);
+
+    try std.testing.expectEqual(@as(u64, 999), getValue(try dictGet(root, &key1, 8)).?);
+    try std.testing.expectEqual(@as(u64, 200), getValue(try dictGet(root, &key2, 8)).?);
+}
+
+test "dict 16-bit keys" {
+    var arena = CellArena.init();
+
+    const key1 = DictKey.fromUint(0x1234, 16);
+    const key2 = DictKey.fromUint(0x5678, 16);
+    const key3 = DictKey.fromUint(0x1235, 16); // shares 15-bit prefix with key1
+
+    var vs1 = makeValue(&arena, 0xA);
+    var root: ?*Cell = try dictSet(null, &key1, 16, &vs1, &arena);
+    var vs2 = makeValue(&arena, 0xB);
+    root = try dictSet(root, &key2, 16, &vs2, &arena);
+    var vs3 = makeValue(&arena, 0xC);
+    root = try dictSet(root, &key3, 16, &vs3, &arena);
+
+    try std.testing.expectEqual(@as(u64, 0xA), getValue(try dictGet(root, &key1, 16)).?);
+    try std.testing.expectEqual(@as(u64, 0xB), getValue(try dictGet(root, &key2, 16)).?);
+    try std.testing.expectEqual(@as(u64, 0xC), getValue(try dictGet(root, &key3, 16)).?);
+}
+
+test "sliceToDictKey" {
+    var arena = CellArena.init();
+    var b = Builder.init();
+    b.storeUint(0b10110000, 8) catch unreachable;
+    const c = b.finalize(&arena) catch unreachable;
+    var s = Slice.fromCell(c);
+
+    const key = try sliceToDictKey(&s, 5);
+    try std.testing.expectEqual(@as(u16, 5), key.bit_len);
+    try std.testing.expectEqual(@as(u1, 1), key.getBit(0));
+    try std.testing.expectEqual(@as(u1, 0), key.getBit(1));
+    try std.testing.expectEqual(@as(u1, 1), key.getBit(2));
+    try std.testing.expectEqual(@as(u1, 1), key.getBit(3));
+    try std.testing.expectEqual(@as(u1, 0), key.getBit(4));
+}
+
+test "DictKey fromUint 16-bit round-trip" {
+    const key = DictKey.fromUint(0xABCD, 16);
+    try std.testing.expectEqual(@as(u64, 0xABCD), key.toUint());
+}
+
+test "DictKey fromInt boundary values" {
+    // Min signed 8-bit
+    const k_min = DictKey.fromInt(-128, 8);
+    try std.testing.expectEqual(@as(i64, -128), k_min.toInt());
+
+    // Max signed 8-bit
+    const k_max = DictKey.fromInt(127, 8);
+    try std.testing.expectEqual(@as(i64, 127), k_max.toInt());
+
+    // Zero
+    const k_zero = DictKey.fromInt(0, 8);
+    try std.testing.expectEqual(@as(i64, 0), k_zero.toInt());
+
+    // 16-bit boundary
+    const k16 = DictKey.fromInt(-32768, 16);
+    try std.testing.expectEqual(@as(i64, -32768), k16.toInt());
+}
